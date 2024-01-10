@@ -289,7 +289,7 @@ def run_analysis(analysis_name, study_name, queue, args):
         for extension_name in extension_names:
             job_id, files = run_extension(job_id, analysis_name, study_name, extension_name, files, queue, args)
     study_dir = get_study_dir(analysis_name, study_name)
-    if not args['--clean']:  # get rid of individual files after merging
+    if args['--clean']:  # get rid of individual files after merging
         shutil.rmtree(study_dir / 'trees')
         shutil.rmtree(study_dir / 'hists')
         shutil.rmtree(study_dir / 'flattrees')
