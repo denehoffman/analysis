@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+Usage:
+    analysis
+    analysis (run | r) [options] (<analysis_names>... | --group <group_names>) [--name <study_name>]
+    analysis (list | ls | l) [--group <group_names>]
+    analysis -h | --help
+
+Options:
+    -c, --clean                remove individual run files after merging. [default: False]
+    -d, --description <text>   enter the description in command line (open $EDITOR otherwise).
+    -e, --ext <extensions>     use extensions specified in ~/.analysis.toml (comma-separated).
+    -f, --force                force execution of analysis and overwrite existing analysis.
+    -g, --group <group_names>  select by group, names may be comma-separated list.
+    -n, --name <study_name>    name of study.
+    -q, --queue <queue_name>   specify queue by name (eg: red). Defaults to queue with fewest
+                               queued jobs with ties broken by config file listing order.
+    -u, --use <n>              use only the first <n> files in each analysis (for testing)
+    -h, --help                 show this help message and exit.
+
+Commands:
+    <none>                     echo path to output files
+    run [alias: r]             run analysis over specified analyses.
+    list [aliases: ls, l]      list valid analysis identifiers.
+"""
+
+
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from subprocess import run
+
+from rich.console import Console
+from rich.table import Table
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+import uproot
+from docopt import docopt
+
+console = Console()
+
+example_config = """
+[general]
+output-directory = "/<raid>/<user>/analysis/"  # Replace with your path
+log-directory = "/<raid>/<user>/analysis/logs" # Replace with your path
+env-file = "/home/<user>/setup.sh"             # Replace with your path
+
+queues = [
+  { name = "blue", total-memory = 128000, cpu-threads = 2, total-nodes = 16, cpus-per-node = 32, node-share = 1.0 },
+  { name = "green", total-memory = 64000, cpu-threads = 1, total-nodes = 8, cpus-per-node = 32, node-share = 1.0 },
+  #{ name = "red", total-memory = 64000, cpu-threads = 2, total-nodes = 11, cpus-per-node=32, node-share = 1.0 },   # red is temporarily offline
+]
+
+[analysis]
+
+[analysis.S17]
+input-directory = "/path/to/spring_17/merged"
+version = "ver52"
+dselector = "/path/to/DSelector.C"
+group = "data"                                 # optional
+
+[extension]
+
+[extension.polarize]
+command = "/home/nhoffman/bin/polarize"               # command takes arguments and creates a new file <filename>_polarized.root
+arguments = ["@flattree.root", "-t", "polarized"]     # valid tags are @flattree, @tree, and @hist
+output = { "@flattree" = "@flattree_polarized" }      # give mappings for the output files if you want to create a pipeline of extensions
+
+###########################################################
+#
+# Usage examples:
+#
+# $ analyze run S17 -q blue -n demo
+# Run over S17 files on blue queue
+#
+# $ analysis run -g data -n demo2
+# Run over all files with group "data" on optimal queue
+#
+# $ analysis run S17 -e polarize -n demo3
+# Run over S17 files and then run the polarize script
+#
+############################################################
+"""
+
+
+def get_config():
+    path = Path(os.environ.get('ANALYSIS_CONFIG', f'/home/{os.getlogin()}/.analysis.toml'))
+    if not path.is_file:
+        path.write_text(example_config)
+        console.print(f'[red]no configuration file found at[/][white]{path!s}[/][red][/]')
+        console.print('[red]an example config file was generated for you, but you need to edit it[/]')
+        console.print('\nby default, this program will look for a config file at')
+        console.print(f'\n[white]/home/{os.getlogin()}/.analysis.toml[/]')
+        console.print('\nbut if the $ANALYSIS_CONFIG environment variable is set, it will use that path')
+        sys.exit(1)
+    return tomllib.loads(path.read_text())
+
+
+config = get_config()
+
+
+def get_tree_name(root_file):
+    with uproot.open(root_file) as df:
+        key = df.keys()[0]
+        if ';' in key:
+            return key.split(';')[0]
+        return key
+
+
+class Queue:
+    def __init__(self, queue_config, min_memory_per_thread):
+        self.name = queue_config['name']
+        self.total_memory = queue_config['total-memory']
+        cpu_threads = queue_config['cpu-threads']
+        total_nodes = queue_config['total-nodes']
+        cpus_per_node = queue_config['cpus-per-node']
+        self.threads_per_node = cpu_threads * cpus_per_node
+        self.total_threads = self.threads_per_node * total_nodes
+        self.node_share = queue_config['node-share']
+        max_threads = int(self.total_threads * self.node_share)
+        max_memory = int(self.total_memory * self.node_share)
+        mem_per_thread = min_memory_per_thread
+        n_threads = 1
+        while mem_per_thread * n_threads < max_memory and n_threads < max_threads:
+            n_threads += 1
+
+        self.threads = n_threads
+        self.nodes = math.ceil(n_threads / self.threads_per_node)
+        self.memory = int(mem_per_thread * n_threads)
+        self.mem_per_cpu = int(mem_per_thread * n_threads)
+
+
+def get_queues_from_config(min_memory_per_thread):
+    return {
+        queue_config['name']: Queue(queue_config, min_memory_per_thread) for queue_config in config['general']['queues']
+    }
+
+
+def get_queue(queue_name, min_memory_per_thread):
+    queues = get_queues_from_config(min_memory_per_thread)
+    if queue_name is None:
+        return next(iter(queues.values()))
+    queue = queues.get(queue_name)
+    if queue is None:
+        console.print(f'[red]no queue [/][blue]{queue}[/][red] in config[/]')
+        console.print(f"[red]valid queues: [/][white]{' '.join(queues.keys())}[/]")
+        sys.exit(0)
+    return queue
+
+
+# https://stackoverflow.com/a/6309753/3288134
+def get_analysis_description():
+    EDITOR = os.environ.get('EDITOR', 'vim')
+    initial_message = b"""
+# Enter a short description of this analysis.
+# Lines which begin in "#" will be ignored.
+# Save this file and quit the editor to continue."""
+    with tempfile.NamedTemporaryFile(suffix='.tmp') as tf:
+        tf.write(initial_message)
+        tf.flush()
+        run([EDITOR, tf.name])
+        tf.seek(0)
+        return '\n'.join([line for line in tf.read().decode().splitlines() if not line.startswith('#')])
+
+
+def check_study_name(analysis_name, study_name):
+    analysis_dir = get_analysis_dir(analysis_name)
+    if analysis_dir.is_dir() and study_name in [p.name for p in analysis_dir.iterdir()]:
+        console.print(
+            f'[red]the study [/][blue]{study_name}[/][red] already exists for the analysis [/][blue]{analysis_name}[/]'
+        )
+        console.print('[red]use the [/][white]--force[/][red] option to overwrite')
+        sys.exit(1)
+
+
+def list_analyses(args):
+    table = Table()
+    table.add_column('name', no_wrap=True, style='blue')
+    table.add_column('path', justify='center', style='white')
+    table.add_column('group', justify='right', style='blue')
+    table.add_column('version', justify='right', style='italic cyan')
+    if args['--group']:
+        for group in args['--group'].split(','):
+            for name, info in config['analysis'].items():
+                if group == info.get('group', 'None'):
+                    table.add_row(name, info['input-directory'], info.get('group', 'None'), info['version'])
+    else:
+        for name, info in config['analysis'].items():
+            table.add_row(name, info['input-directory'], info.get('group', 'None'), info['version'])
+    console.print(table)
+
+
+def get_group(group_names):
+    return [key for key, val in config['analysis'].items() for group_name in group_names if val['group'] == group_name]
+
+
+def check_analysis_name(analysis_name):
+    if config['analysis'].get(analysis_name) is None:
+        console.print(f'[red]no analysis found with name [/][blue]{analysis_name}[/][red]')
+        sys.exit(1)
+
+
+def get_analysis_dir(analysis_name):
+    check_analysis_name(analysis_name)
+    return (
+        Path(config['general']['output-directory'])
+        / Path(analysis_name)
+        / Path(config['analysis'][analysis_name]['version'])
+    )
+
+
+def get_study_dir(analysis_name, study_name):
+    path = (
+        Path(config['general']['output-directory'])
+        / Path(analysis_name)
+        / Path(config['analysis'][analysis_name]['version'])
+        / Path(study_name)
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    tree_path = path / Path('trees')
+    tree_path.mkdir(exist_ok=True)
+    flattree_path = path / Path('flattrees')
+    flattree_path.mkdir(exist_ok=True)
+    hist_path = path / Path('hists')
+    hist_path.mkdir(exist_ok=True)
+    return path
+
+
+def run_analyses(args):
+    analysis_set = []
+    if args['<analysis_names>']:
+        analysis_set = set(args['<analysis_names>'])
+    elif args['--group']:
+        analysis_set = set(get_group(args['--group'].split(',')))
+    else:
+        console.print('[red]you must specify either a set of run periods or a group (with -g)[/]')
+        sys.exit(1)
+    for analysis_name in analysis_set:
+        check_analysis_name(analysis_name)
+    min_memory_per_thread = 0
+    for analysis_name in analysis_set:
+        input_directory = Path(config['analysis'][analysis_name]['input-directory'])
+        max_filesize = max(
+            [root_file.stat().st_size / (1024 * 1024) * 1.4 for root_file in input_directory.glob('*.root')]
+        )
+        min_memory_per_thread = max([min_memory_per_thread, max_filesize])
+    queue = get_queue(args['--queue'], min_memory_per_thread)
+    # the queue stuff still needs work, I don't understand it
+    # print(f'Uses {queue.threads / queue.total_threads:.2%} of available threads')
+    # print(f'Uses {queue.memory / queue.total_memory:.2%} of available memory')
+    study_name = args['--name']
+    if not args['--force']:
+        for analysis_name in analysis_set:
+            check_study_name(analysis_name, study_name)
+    log_path = Path(config['general']['log-directory'])
+    shutil.rmtree(log_path)
+    log_path.mkdir(parents=True, exist_ok=True)
+    console.print('running analyses over the following datasets:')
+    console.print(', '.join(f'[blue]{analysis_name}[/]' for analysis_name in analysis_set))
+    for analysis_name in analysis_set:
+        run_analysis(analysis_name, study_name, queue, args)
+    desc_text = args['--description'] if args.get('--desceription') else get_analysis_description()
+    desc_file = get_study_dir(analysis_name, study_name) / 'desc'
+    desc_file.write_text(desc_text)
+
+
+def run_analysis(analysis_name, study_name, queue, args):
+    job_name = submit_jobs(analysis_name, study_name, queue, args)
+    job_id = par_hadd(job_name, analysis_name, study_name, queue, args)
+    if args['-e']:
+        extension_names = args['-e'].split(',')
+        files = {
+            '@tree': f'tree_{study_name}',
+            '@hist': f'hist_{study_name}',
+            '@flattree': f'flattree_{study_name}',
+        }
+        for extension_name in extension_names:
+            job_id, files = run_extension(job_id, analysis_name, study_name, extension_name, files, queue, args)
+    study_dir = get_study_dir(analysis_name, study_name)
+    if not args['--clean']:  # get rid of individual files after merging
+        shutil.rmtree(study_dir / 'trees')
+        shutil.rmtree(study_dir / 'hists')
+        shutil.rmtree(study_dir / 'flattrees')
+
+
+def run_slurm_script(content):
+    with tempfile.NamedTemporaryFile(mode='w+', suffix='.sh', delete=False) as tf:
+        tf.write(content)
+        tf.flush()
+        return run(['sbatch', tf.name], stdout=subprocess.PIPE, encoding='utf-8').stdout.split()[-1]
+
+
+def submit_jobs(analysis_name, study_name, queue, args):
+    study_dir = get_study_dir(analysis_name, study_name)
+    dselector_c_path = Path(config['analysis'][analysis_name]['dselector'])
+    dselector_name = dselector_c_path.name
+    dselector_h_path = str(dselector_c_path)[:-2] + '.h'
+    shutil.copy(dselector_c_path, study_dir)  # Copy DSelector.C
+    shutil.copy(dselector_h_path, study_dir)  # Copy DSelector.h
+    job_name = f'{study_name}_{analysis_name}'
+    input_dir = Path(config['analysis'][analysis_name]['input-directory'])
+    input_files = list(input_dir.glob('*.root'))
+    tree_name = get_tree_name(input_files[0])
+    content = f"""#!/bin/sh
+#SBATCH --job-name={job_name}
+#SBATCH --array=1-{args['--use'] if args.get('--use') else len(input_files)}
+#SBATCH --nodes={queue.nodes}
+#SBATCH --ntasks={queue.threads}
+#SBATCH --partition={queue.name}
+#SBATCH --output={config['general']['log-directory']}/log_%A_%a.out
+#SBATCH --output={config['general']['log-directory']}/log_%A_%a.err
+#SBATCH --time=1:00:00
+
+WORKINGDIR="/scratch/slurm_$SLURM_JOB_ID"
+scp="/usr/bin/scp"
+source {config['general']['env-file']}
+cd "$WORKINGDIR"
+pwd
+echo "Contents of working directory:"
+ls -lh
+
+echo "task:"
+echo $SLURM_ARRAY_TASK_ID
+echo "$(ls {input_dir}/*.root | sed -n "${{SLURM_ARRAY_TASK_ID}}p")"
+
+inputpath="$(ls {input_dir}/*.root | sed -n "${{SLURM_ARRAY_TASK_ID}}p")"
+inputname="$(basename $inputpath)"
+echo "Input file: $inputname"
+inputname_hist=$(echo "$inputname" | sed 's/tree/hist/')
+inputname_flattree=$(echo "$inputname" | sed 's/tree/flattree/')
+
+echo "Copying files..."
+scp "{dselector_c_path}" ./
+scp "{dselector_h_path}" ./
+scp -l 10000 "$inputpath" ./
+
+echo "Setting up outputs..."
+sed -i 's/dOutputFileName = ".*";/dOutputFileName = "hist.root";/g' "{dselector_name}"
+sed -i 's/dOutputTreeFileName = ".*";/dOutputTreeFileName = "tree.root";/g' "{dselector_name}"
+sed -i 's/dFlatTreeFileName = ".*";/dFlatTreeFileName = "flat.root";/g' "{dselector_name}"
+head "{dselector_name}"
+
+
+echo "Contents of working directory:"
+ls -lh
+
+echo "Creating a ROOT macro called run.C"
+cat << EOF > run.C
+void run() {{
+    gROOT->ProcessLine(".x $ROOT_ANALYSIS_HOME/scripts/Load_DSelector.C");
+    cout << "Checking path name '$inputname': " << !gSystem->AccessPathName("$WORKINGDIR/$inputname") << endl;
+    if(!gSystem->AccessPathName("$WORKINGDIR/$inputname")) {{
+        gROOT->ProcessLine("TChain *chain = new TChain(\\"{tree_name}\\");");
+        gROOT->ProcessLine("chain->Add(\\"$WORKINGDIR/$inputname\\");");
+        gROOT->ProcessLine("chain->Process(\\"{dselector_name}+\\");");
+    }}
+}}
+EOF
+
+echo "run.C:"
+cat run.C
+echo "Calling run.C"
+root -l -b -q run.C
+echo "Script complete!"
+
+echo "Contents of working directory:"
+ls -lh
+
+echo "Copying files out of scratch:"
+
+scp "$WORKINGDIR/tree.root" "{study_dir}/trees/$inputname"
+echo "$WORKINGDIR/tree.root -> {study_dir}/hists/$inputname"
+scp "$WORKINGDIR/hist.root" "{study_dir}/hists/$inputname_hist"
+echo "$WORKINGDIR/hist.root -> {study_dir}/hists/$inputname_hist"
+scp "$WORKINGDIR/flat.root" "{study_dir}/flattrees/$inputname_flattree"
+echo "$WORKINGDIR/flat.root -> {study_dir}/hists/$inputname_flattree"
+
+echo "DONE"
+"""
+    _job_id = run_slurm_script(content)
+    return job_name
+
+
+def par_hadd(job_name, analysis_name, study_name, queue, args):
+    study_dir = get_study_dir(analysis_name, study_name)
+    input_dir = study_dir / 'trees'
+    input_endings = [file.name[5:] for file in input_dir.glob('*.root')]
+    out_ending = study_name + '.root'
+    content = f"""#!/bin/sh
+#SBATCH --job-name={job_name}
+#SBATCH --dependency=singleton
+#SBATCH --nodes=1
+#SBATCH --ntasks={queue.threads_per_node}
+#SBATCH --partition={queue.name}
+#SBATCH --output={config['general']['log-directory']}/merge_log_%A.out
+#SBATCH --output={config['general']['log-directory']}/merge_log_%A.err
+#SBATCH --time=1:00:00
+
+source {config['general']['env-file']}
+
+echo "Merging Trees..."
+echo "hadd -O -f -j {queue.threads_per_node} {study_dir}/tree_{out_ending} {' '.join(f'{study_dir}/trees/tree_{ending}' for ending in input_endings[:4])} ..."
+hadd -O -f -j {queue.threads_per_node} {study_dir}/tree_{out_ending} {' '.join(f'{study_dir}/trees/tree_{ending}' for ending in input_endings)}
+
+echo "Merging Hists..."
+echo "hadd -O -f -j {queue.threads_per_node} {study_dir}/hist_{out_ending} {' '.join(f'{study_dir}/hists/hist_{ending}' for ending in input_endings[:4])} ..."
+hadd -O -f -j {queue.threads_per_node} {study_dir}/hist_{out_ending} {' '.join(f'{study_dir}/hists/hist_{ending}' for ending in input_endings)}
+
+echo "Merging FlatTrees..."
+echo "hadd -O -f -j {queue.threads_per_node} {study_dir}/flattree_{out_ending} {' '.join(f'{study_dir}/flattrees/flattree_{ending}' for ending in input_endings[:4])} ..."
+hadd -O -f -j {queue.threads_per_node} {study_dir}/flattree_{out_ending} {' '.join(f'{study_dir}/flattrees/flattree_{ending}' for ending in input_endings)}
+
+echo "DONE"
+    """
+    return run_slurm_script(content)
+
+
+def run_extension(job_id, analysis_name, study_name, extension_name, files, queue, args):
+    extension = config['extension'].get(extension_name)
+    if extension is None:
+        console.print(f'[red]extension [/][blue]{extension_name}[/][red] not found[/]')
+        sys.exit(1)
+    cwd = get_study_dir(analysis_name, study_name)
+    cmd_args = []
+    for arg in extension['arguments']:
+        new_arg = arg
+        for key, value in files.items():
+            new_arg = new_arg.replace(key, value)
+        cmd_args.append(new_arg)
+    for output_key, output_val in extension['output'].items():
+        new_val = output_val
+        for key, value in files.items():
+            new_val = new_val.replace(key, value)
+        files[output_key] = new_val
+    command = extension['command']
+    content = f"""#!/bin/sh
+#SBATCH --job-name={extension_name}_{study_name}
+#SBATCH --dependency=afterok:{job_id}
+#SBATCH --nodes=1
+#SBATCH --ntasks={queue.threads_per_node}
+#SBATCH --partition={queue.name}
+#SBATCH --output={config['general']['log-directory']}/{extension_name}_log_%A.out
+#SBATCH --output={config['general']['log-directory']}/{extension_name}_log_%A.err
+#SBATCH --time=1:00:00
+
+cd {cwd}
+{command} {' '.join(cmd_args)}
+
+echo "DONE"
+    """
+    return run_slurm_script(content), files
+
+
+def main():
+    args = docopt(__doc__)
+    if args.get('run') or args.get('r'):
+        if not args.get('--name'):
+            console.print('[red]you must specify a study name with the [/][blue]--name[/][red] argument!')
+        run_analyses(args)
+    elif args.get('list') or args.get('ls') or args.get('l'):
+        list_analyses(args)
+    else:
+        console.print(Path(config['general']['output-directory']))
+
+
+if __name__ == '__main__':
+    main()
