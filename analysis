@@ -257,29 +257,30 @@ def run_analyses(args):
     # print(f'Uses {queue.memory / queue.total_memory:.2%} of available memory')
     study_name = args['--name']
     if study_name is None:
-        study_name = console.input('[blue]enter a name for this study[/] ')
+        study_name = console.input('[blue]enter a name for this study[/]: ')
     if not study_name:
         console.print('[red]you must specify a name for this study[/]')
     if not args['--force']:
         for analysis_name in analysis_set:
             check_study_name(analysis_name, study_name)
     log_path = Path(config['general']['log-directory'])
-    shutil.rmtree(log_path)
+    if log_path.is_dir():
+        shutil.rmtree(log_path)
     log_path.mkdir(parents=True, exist_ok=True)
     console.print('running analyses over the following datasets:')
     console.print(', '.join(f'[blue]{analysis_name}[/]' for analysis_name in analysis_set))
+    desc_text = args['--description'] if args.get('--description') else get_analysis_description()
     for analysis_name in analysis_set:
         run_analysis(analysis_name, study_name, queue, args)
-    desc_text = args['--description'] if args.get('--desceription') else get_analysis_description()
-    desc_file = get_study_dir(analysis_name, study_name) / 'desc'
-    desc_file.write_text(desc_text)
+        desc_file = get_study_dir(analysis_name, study_name) / 'desc'
+        desc_file.write_text(desc_text)
 
 
 def run_analysis(analysis_name, study_name, queue, args):
     job_name = submit_jobs(analysis_name, study_name, queue, args)
     job_id = par_hadd(job_name, analysis_name, study_name, queue, args)
-    if args['-e']:
-        extension_names = args['-e'].split(',')
+    if args.get('--ext'):
+        extension_names = args['--ext'].split(',')
         files = {
             '@tree': f'tree_{study_name}',
             '@hist': f'hist_{study_name}',
@@ -465,8 +466,6 @@ echo "DONE"
 def main():
     args = docopt(__doc__)
     if args.get('run') or args.get('r'):
-        if not args.get('--name'):
-            console.print('[red]you must specify a study name with the [/][blue]--name[/][red] argument!')
         run_analyses(args)
     elif args.get('list') or args.get('ls') or args.get('l'):
         list_analyses(args)
