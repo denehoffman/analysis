@@ -6,12 +6,12 @@
 </p>
 
 <p align="center">
-  <img alt="CMU Physics Homepage" src="https://img.shields.io/badge/CMU-C41230?link=https://www.cmu.edu/physics/">
-  <img alt="GlueX Wiki" src="https://img.shields.io/badge/Gluex-33348e?link=https://halldweb.jlab.org/wiki/index.php/Main_Page">
-  <img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/denehoffman/analysis/main?link=https://github.com/denehoffman/analysis/commits/main/">
+  <a href="https://www.cmu.edu/physics/"><img alt="CMU Physics Homepage" src="https://img.shields.io/badge/CMU-C41230"></a>
+  <a href="https://halldweb.jlab.org/wiki/index.php/Main_Page"><img alt="GlueX Wiki" src="https://img.shields.io/badge/Gluex-33348e"></a>
+  <a href="https://github.com/denehoffman/analysis/commits/main/"><img alt="GitHub Last Commit" src="https://img.shields.io/github/last-commit/denehoffman/analysis/main"></a>
   <img alt="GitHub lines of Code" src="https://img.shields.io/tokei/lines/github/denehoffman/analysis">
   <img alt="GitHub Top Language" src="https://img.shields.io/github/languages/top/denehoffman/analysis">
-  <img alt="GitHub License" src="https://img.shields.io/github/license/denehoffman/analysis?link=https://github.com/denehoffman/analysis/blob/main/LICENSE">
+  <a href="https://github.com/denehoffman/analysis/blob/main/LICENSE"><img alt="GitHub License" src="https://img.shields.io/github/license/denehoffman/analysis"></a>
 </p>
 
 I built this project because I realize I will soon be embarking on the systematic-error-identifying part of my research, and will therefore have to run my analysis pipeline more often. In search of efficiency, organization, and ease of use, I've settled on this tool. All analyses will be output to generally the same location in a nice and neat way, extensive logs are kept for each part of the pipeline, and SLURM jobs are made dependent on each other, so all jobs will run in sequence and you are free to use your terminal emulator again.
