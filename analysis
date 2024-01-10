@@ -256,6 +256,10 @@ def run_analyses(args):
     # print(f'Uses {queue.threads / queue.total_threads:.2%} of available threads')
     # print(f'Uses {queue.memory / queue.total_memory:.2%} of available memory')
     study_name = args['--name']
+    if study_name is None:
+        study_name = console.input('[blue]enter a name for this study[/] ')
+    if not study_name:
+        console.print('[red]you must specify a name for this study[/]')
     if not args['--force']:
         for analysis_name in analysis_set:
             check_study_name(analysis_name, study_name)
