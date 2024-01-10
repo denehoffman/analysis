@@ -455,6 +455,8 @@ def run_extension(job_id, analysis_name, study_name, extension_name, files, queu
 #SBATCH --output={config['general']['log-directory']}/{extension_name}_log_%A.err
 #SBATCH --time=1:00:00
 
+source {config['general']['env-file']}
+
 cd {cwd}
 {command} {' '.join(cmd_args)}
 
